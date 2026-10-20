@@ -2,6 +2,7 @@ use super::FromUrl;
 use crate::tunnel::common::bind;
 use crate::{proto::common::TunnelInfo, socket::tcp::RuntimeTcpSocket};
 use anyhow::Context as _;
+use base64::Engine as _;
 use bytes::BytesMut;
 use cidr::IpCidr;
 use easytier_core::{
@@ -12,16 +13,17 @@ use easytier_core::{
 use forwarded_header_value::ForwardedHeaderValue;
 use futures::{Sink, StreamExt};
 use std::{
+    collections::HashMap,
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{Arc, LazyLock},
     task::{Context, Poll},
     time::Duration,
 };
-use tokio::{net::TcpListener, time::timeout};
+use tokio::{net::TcpListener, net::TcpSocket, time::timeout};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::either::Either;
-use tokio_websockets::{ClientBuilder, Limits, MaybeTlsStream, Message, ServerBuilder};
+use tokio_websockets::{ClientBuilder, Limits, MaybeTlsStream, Message, ServerBuilder, WebSocketStream};
 use zerocopy::AsBytes as _;
 
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -55,8 +57,8 @@ fn websocket_error(error: impl std::fmt::Display) -> TunnelError {
 
 fn is_wss(url: &url::Url) -> Result<bool, TunnelError> {
     match url.scheme() {
-        "ws" => Ok(false),
-        "wss" => Ok(true),
+        "ws" | "http" => Ok(false),
+        "wss" | "https" => Ok(true),
         scheme => Err(TunnelError::InvalidProtocol(scheme.to_owned())),
     }
 }
@@ -286,6 +288,278 @@ fn socket_url(scheme: &str, addr: SocketAddr) -> url::Url {
     url
 }
 
+/// Result of a manual WebSocket upgrade attempt.
+enum UpgradeOutcome<S> {
+    /// Upgrade succeeded, stream is ready for WebSocket frames.
+    Success(WebSocketStream<BufferedStream<S>>),
+    /// Server returned a redirect (3xx). `location` is the redirect target,
+    /// `set_cookies` are the Set-Cookie headers to record.
+    Redirect {
+        location: String,
+        set_cookies: Vec<String>,
+    },
+}
+
+/// A simple cookie jar that stores cookies as name=value pairs.
+#[derive(Debug, Default)]
+struct CookieJar {
+    cookies: HashMap<String, String>,
+}
+
+impl CookieJar {
+    /// Parse a Set-Cookie header value and store the cookie.
+    fn add_set_cookie(&mut self, header_value: &str) {
+        if let Some((name_value, _attrs)) = header_value.split_once(';') {
+            if let Some((name, value)) = name_value.split_once('=') {
+                self.cookies
+                    .insert(name.trim().to_string(), value.trim().to_string());
+            }
+        } else if let Some((name, value)) = header_value.split_once('=') {
+            self.cookies
+                .insert(name.trim().to_string(), value.trim().to_string());
+        }
+    }
+
+    /// Format all stored cookies as a Cookie header value: name1=value1; name2=value2
+    fn to_cookie_header(&self) -> String {
+        self.cookies
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// Load cookies from a file (one "name=value" per line, or Netscape format).
+    fn load_from_file(path: &str) -> Result<Self, std::io::Error> {
+        let content = std::fs::read_to_string(path)?;
+        let mut jar = CookieJar::default();
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if line.contains('\t') {
+                let fields: Vec<&str> = line.split('\t').collect();
+                if fields.len() >= 7 {
+                    jar.cookies
+                        .insert(fields[5].trim().to_string(), fields[6].trim().to_string());
+                }
+            } else if let Some((name, value)) = line.split_once('=') {
+                jar.cookies
+                    .insert(name.trim().to_string(), value.trim().to_string());
+            }
+        }
+        Ok(jar)
+    }
+}
+
+/// A stream wrapper that prepends leftover bytes (read during HTTP upgrade)
+/// back to the front of the underlying stream.
+struct BufferedStream<S> {
+    inner: S,
+    leftover: BytesMut,
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for BufferedStream<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if !self.leftover.is_empty() {
+            let len = self.leftover.len().min(buf.remaining());
+            buf.put_slice(&self.leftover[..len]);
+            let _ = self.leftover.split_to(len);
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for BufferedStream<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Resolve a redirect Location against the current URL.
+fn resolve_redirect(current: &url::Url, location: &str) -> Result<url::Url, TunnelError> {
+    if location.starts_with("http://") || location.starts_with("https://") {
+        location
+            .parse()
+            .map_err(|_| TunnelError::InvalidAddr(format!("invalid redirect url: {location}")))
+    } else {
+        current
+            .join(location)
+            .map_err(|_| TunnelError::InvalidAddr(format!("invalid redirect url: {location}")))
+    }
+}
+
+/// Manually perform WebSocket HTTP upgrade handshake.
+/// Supports HTTP 302 redirects and cookie recording.
+async fn manual_ws_upgrade<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    builder: &ClientBuilder<'_>,
+    mut stream: S,
+    addr: &url::Url,
+    cookie_jar: &CookieJar,
+) -> Result<UpgradeOutcome<S>, TunnelError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let key = {
+        let random_bytes: [u8; 16] = rand::random();
+        base64::engine::general_purpose::STANDARD.encode(&random_bytes)
+    };
+
+    let host = addr.host_str().unwrap_or("");
+    let path = addr.path();
+    let query = addr.query();
+    let path_and_query = match query {
+        Some(q) => format!("{}?{}", path, q),
+        None => path.to_string(),
+    };
+
+    let cookie_header = if cookie_jar.cookies.is_empty() {
+        String::new()
+    } else {
+        format!("Cookie: {}\r\n", cookie_jar.to_cookie_header())
+    };
+
+    let request = format!(
+        "GET {path_and_query} HTTP/1.1\r\n\
+         Host: {host}\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Key: {key}\r\n\
+         Sec-WebSocket-Version: 13\r\n\
+         {cookie_header}\
+         \r\n"
+    );
+
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(TunnelError::IOError)?;
+    stream.flush().await.map_err(TunnelError::IOError)?;
+
+    let mut buf = vec![0u8; 8192];
+    let mut total_read = 0;
+
+    let (header_end, status_code, location, set_cookies) = loop {
+        if total_read >= buf.len() {
+            buf.resize(buf.len() * 2, 0);
+        }
+        let n = stream
+            .read(&mut buf[total_read..])
+            .await
+            .map_err(TunnelError::IOError)?;
+        if n == 0 {
+            return Err(TunnelError::IOError(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "connection closed during WebSocket handshake",
+            )));
+        }
+        total_read += n;
+
+        // Look for the end of HTTP headers: \r\n\r\n
+        let header_end = buf[..total_read]
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|p| p + 4);
+
+        if let Some(header_end) = header_end {
+            let header_block = &buf[..header_end];
+            let mut lines = header_block.split(|&b| b == b'\n');
+
+            // Parse status line: HTTP/1.1 <code> <reason>
+            let status_code = lines
+                .next()
+                .and_then(|line| {
+                    let mut parts = line.split(|&b| b == b' ');
+                    parts.next(); // skip "HTTP/1.1"
+                    parts.next().and_then(|code| {
+                        std::str::from_utf8(code).ok().and_then(|s| s.trim().parse::<u16>().ok())
+                    })
+                })
+                .unwrap_or(0);
+
+            let mut location = String::new();
+            let mut set_cookies: Vec<String> = Vec::new();
+
+            for line in lines {
+                let line = line.strip_suffix(b"\r").unwrap_or(line);
+                if line.is_empty() {
+                    continue;
+                }
+                if let Some(colon) = line.iter().position(|&b| b == b':') {
+                    let name = &line[..colon];
+                    let value = &line[colon + 1..];
+                    let value_str = String::from_utf8_lossy(value).trim().to_string();
+                    if name.eq_ignore_ascii_case(b"Location") {
+                        location = value_str;
+                    } else if name.eq_ignore_ascii_case(b"Set-Cookie") {
+                        set_cookies.push(value_str);
+                    }
+                }
+            }
+
+            break (header_end, status_code, location, set_cookies);
+        }
+    };
+
+    if (301..=308).contains(&status_code) {
+        if location.is_empty() {
+            return Err(websocket_error(format!(
+                "redirect {status_code} without Location header"
+            )));
+        }
+
+        if location.contains("account.aliyun.com") {
+            tracing::info!(
+                "WebSocket upgrade redirected to aliyun login: {}. \
+                 Recording {} cookie(s). Set EASYTIER_COOKIE_FILE to authenticate.",
+                location,
+                set_cookies.len()
+            );
+        } else {
+            tracing::info!("WebSocket upgrade redirected ({status_code}): {location}");
+        }
+
+        return Ok(UpgradeOutcome::Redirect {
+            location,
+            set_cookies,
+        });
+    }
+
+    if status_code != 101 {
+        return Err(websocket_error(format!(
+            "server did not switch protocols, status: {status_code}"
+        )));
+    }
+
+    let leftover = BytesMut::from(&buf[header_end..total_read]);
+    let stream = BufferedStream {
+        inner: stream,
+        leftover,
+    };
+
+    Ok(UpgradeOutcome::Success(builder.take_over(stream)))
+}
+
 #[derive(Debug)]
 pub struct WsTunnelListener {
     addr: url::Url,
@@ -371,7 +645,7 @@ pub(crate) async fn upgrade_connected<S>(
 where
     S: VirtualTcpSocket,
 {
-    let is_wss = is_wss(&remote_url)?;
+    let initial_is_wss = is_wss(&remote_url)?;
     let local_addr = stream.local_addr()?;
     let resolved_remote_addr = stream.peer_addr()?;
     let info = TunnelInfo {
@@ -389,9 +663,23 @@ where
         ),
     };
 
-    let client = ClientBuilder::from_uri(http::Uri::try_from(remote_url.to_string()).unwrap())
-        .max_headers(128);
-    let stream: MaybeTlsStream<S> = if is_wss {
+    let mut cookie_jar = if let Ok(path) = std::env::var("EASYTIER_COOKIE_FILE") {
+        match CookieJar::load_from_file(&path) {
+            Ok(jar) => {
+                tracing::info!("Loaded {} cookie(s) from {path}", jar.cookies.len());
+                jar
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load cookies from {path}: {e}");
+                CookieJar::default()
+            }
+        }
+    } else {
+        CookieJar::default()
+    };
+
+    let mut current_url = remote_url.clone();
+    let initial_stream: MaybeTlsStream<S> = if initial_is_wss {
         let tls = tokio_rustls::TlsConnector::from(Arc::new(get_insecure_tls_client_config()));
         let sni = remote_url.domain().unwrap_or("localhost").to_owned();
         let server_name = rustls::pki_types::ServerName::try_from(sni)
@@ -401,12 +689,57 @@ where
         MaybeTlsStream::Plain(stream)
     };
 
-    let (client, _) = client.connect_on(stream).await.map_err(websocket_error)?;
-    let (write, read) = client.split();
-    Ok(Box::new(TunnelWrapper::new(
-        read.filter_map(map_from_ws_message),
-        WebSocketPacketSink::new(write),
-        Some(info),
+    let mut stream: Either<MaybeTlsStream<S>, MaybeTlsStream<RuntimeTcpSocket>> =
+        Either::Left(initial_stream);
+
+    const MAX_REDIRECTS: usize = 10;
+    for _ in 0..MAX_REDIRECTS {
+        let builder =
+            ClientBuilder::from_uri(http::Uri::try_from(current_url.to_string()).unwrap())
+                .max_headers(128);
+        match manual_ws_upgrade(&builder, stream, &current_url, &cookie_jar).await? {
+            UpgradeOutcome::Success(client) => {
+                let (write, read) = client.split();
+                return Ok(Box::new(TunnelWrapper::new(
+                    read.filter_map(map_from_ws_message),
+                    WebSocketPacketSink::new(write),
+                    Some(info),
+                )));
+            }
+            UpgradeOutcome::Redirect {
+                location,
+                set_cookies,
+            } => {
+                for cookie in &set_cookies {
+                    cookie_jar.add_set_cookie(cookie);
+                }
+                current_url = resolve_redirect(&current_url, &location)?;
+                let new_is_wss = is_wss(&current_url)?;
+                let addr = SocketAddr::from_url(current_url.clone(), IpVersion::Both).await?;
+                let socket = if addr.is_ipv4() {
+                    TcpSocket::new_v4()?
+                } else {
+                    TcpSocket::new_v6()?
+                };
+                let tcp_stream = socket.connect(addr).await?;
+                let rt_socket = RuntimeTcpSocket::new(tcp_stream);
+                let new_stream: MaybeTlsStream<RuntimeTcpSocket> = if new_is_wss {
+                    let tls = tokio_rustls::TlsConnector::from(Arc::new(
+                        get_insecure_tls_client_config(),
+                    ));
+                    let sni = current_url.domain().unwrap_or("localhost").to_owned();
+                    let server_name = rustls::pki_types::ServerName::try_from(sni)
+                        .map_err(|_| TunnelError::InvalidProtocol("Invalid SNI".to_owned()))?;
+                    MaybeTlsStream::Rustls(tls.connect(server_name, rt_socket).await?)
+                } else {
+                    MaybeTlsStream::Plain(rt_socket)
+                };
+                stream = Either::Right(new_stream);
+            }
+        }
+    }
+    Err(websocket_error(format!(
+        "too many redirects (max {MAX_REDIRECTS})"
     )))
 }
 
