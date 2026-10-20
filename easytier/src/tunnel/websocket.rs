@@ -422,7 +422,7 @@ async fn manual_ws_upgrade<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unp
 
     let key = {
         let random_bytes: [u8; 16] = rand::random();
-        base64::engine::general_purpose::STANDARD.encode(&random_bytes)
+        base64::engine::general_purpose::STANDARD.encode(random_bytes)
     };
 
     let host = addr.host_str().unwrap_or("");
