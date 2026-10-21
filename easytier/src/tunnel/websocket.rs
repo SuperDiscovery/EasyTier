@@ -23,7 +23,9 @@ use std::{
 use tokio::{net::TcpListener, net::TcpSocket, time::timeout};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::either::Either;
-use tokio_websockets::{ClientBuilder, Limits, MaybeTlsStream, Message, ServerBuilder, WebSocketStream};
+use tokio_websockets::{
+    ClientBuilder, Limits, MaybeTlsStream, Message, ServerBuilder, WebSocketStream,
+};
 use zerocopy::AsBytes as _;
 
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -351,6 +353,237 @@ impl CookieJar {
         }
         Ok(jar)
     }
+
+    /// Persist the cookies as one "name=value" per line.
+    fn save_to_file(&self, path: &std::path::Path) -> Result<(), std::io::Error> {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let body = self
+            .cookies
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(path, body)
+    }
+
+    /// Whether the jar already carries an authenticated aliyun session.
+    fn has_login_session(&self) -> bool {
+        self.cookies.contains_key("login_aliyunid_ticket")
+            || self.cookies.contains_key("login_aliyunid_pk")
+            || (self.cookies.contains_key("cookie2") && self.cookies.contains_key("unb"))
+    }
+}
+
+/// Where harvested cookies are stored; `EASYTIER_COOKIE_FILE` wins if set.
+fn cookie_file_path() -> std::path::PathBuf {
+    std::env::var("EASYTIER_COOKIE_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("easytier-aliyun-cookies.txt"))
+}
+
+fn is_aliyun_login_url(url: &str) -> bool {
+    url.contains("account.aliyun.com")
+}
+
+fn free_local_port() -> Result<u16, TunnelError> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .map_err(|e| websocket_error(format!("cannot reserve a local port: {e}")))?;
+    listener
+        .local_addr()
+        .map(|addr| addr.port())
+        .map_err(|e| websocket_error(format!("cannot read the reserved port: {e}")))
+}
+
+/// Launch a Chromium-based browser with remote debugging enabled, so that the
+/// cookies of the login flow can be read afterwards.
+fn launch_browser(login_url: &str, port: u16) -> Result<std::process::Child, TunnelError> {
+    use std::process::{Command, Stdio};
+
+    let profile = std::env::temp_dir().join(format!("easytier-login-{}", std::process::id()));
+    let args = [
+        format!("--remote-debugging-port={port}"),
+        format!("--user-data-dir={}", profile.display()),
+        "--no-first-run".to_owned(),
+        "--no-default-browser-check".to_owned(),
+        login_url.to_owned(),
+    ];
+
+    let mut candidates = Vec::new();
+    if let Ok(browser) = std::env::var("EASYTIER_BROWSER") {
+        candidates.push(browser);
+    }
+    candidates.extend(
+        [
+            "microsoft-edge",
+            "microsoft-edge-stable",
+            "microsoft-edge-beta",
+            "microsoft-edge-dev",
+            "msedge",
+            "google-chrome",
+            "google-chrome-stable",
+            "chromium",
+            "chromium-browser",
+            "brave-browser",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        ]
+        .map(str::to_owned),
+    );
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        candidates.push(format!(
+            r"{local_app_data}\Microsoft\Edge\Application\msedge.exe"
+        ));
+    }
+
+    for candidate in candidates {
+        if let Ok(child) = Command::new(&candidate)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            tracing::info!("Opened {candidate} for the aliyun login");
+            return Ok(child);
+        }
+    }
+
+    Err(websocket_error(
+        "no Chromium-based browser found, set EASYTIER_BROWSER to the browser executable"
+            .to_owned(),
+    ))
+}
+
+async fn http_get_local(port: u16, path: &str) -> Result<String, TunnelError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .map_err(|e| websocket_error(format!("devtools endpoint is not ready: {e}")))?;
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(TunnelError::IOError)?;
+    let mut buf = Vec::new();
+    stream
+        .read_to_end(&mut buf)
+        .await
+        .map_err(TunnelError::IOError)?;
+    let response = String::from_utf8_lossy(&buf).into_owned();
+    Ok(response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_owned())
+        .unwrap_or_default())
+}
+
+/// Pop up a browser window for the user to sign in, then harvest the aliyun
+/// cookies through the Chromium DevTools protocol and store them on disk.
+async fn interactive_login(
+    login_url: &str,
+    cookie_file: &std::path::Path,
+) -> Result<CookieJar, TunnelError> {
+    use futures::{SinkExt, StreamExt};
+
+    let port = free_local_port()?;
+    let mut child = launch_browser(login_url, port)?;
+
+    // Wait for the devtools endpoint of the freshly started browser.
+    let mut websocket_url = None;
+    for _ in 0..100 {
+        if let Ok(body) = http_get_local(port, "/json/version").await
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&body)
+            && let Some(url) = value["webSocketDebuggerUrl"].as_str()
+        {
+            websocket_url = Some(url.to_owned());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let websocket_url = websocket_url.ok_or_else(|| {
+        websocket_error("the browser did not expose a devtools endpoint".to_owned())
+    })?;
+
+    let uri = http::Uri::try_from(websocket_url.clone())
+        .map_err(|e| websocket_error(format!("invalid devtools url {websocket_url}: {e}")))?;
+    let (mut ws, _) = ClientBuilder::from_uri(uri)
+        .connect()
+        .await
+        .map_err(|e| websocket_error(format!("cannot reach the browser devtools: {e}")))?;
+
+    let wait_secs: u64 = std::env::var("EASYTIER_LOGIN_TIMEOUT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(300);
+    tracing::info!("Waiting up to {wait_secs}s for the aliyun login to finish");
+
+    let mut method = "Storage.getCookies";
+    for _ in 0..wait_secs {
+        if ws
+            .send(Message::text(format!(
+                "{{\"id\":1,\"method\":\"{method}\"}}"
+            )))
+            .await
+            .is_err()
+        {
+            break;
+        }
+
+        let mut jar = CookieJar::default();
+        while let Ok(Some(Ok(message))) =
+            tokio::time::timeout(Duration::from_secs(5), ws.next()).await
+        {
+            let Some(text) = message.as_text() else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+                continue;
+            };
+            if value["id"] != 1 {
+                continue;
+            }
+            if value.get("error").is_some() {
+                method = "Network.getAllCookies";
+                break;
+            }
+            for cookie in value["result"]["cookies"].as_array().into_iter().flatten() {
+                let domain = cookie["domain"].as_str().unwrap_or_default();
+                if !domain.contains("aliyun.com") {
+                    continue;
+                }
+                if let (Some(name), Some(value)) =
+                    (cookie["name"].as_str(), cookie["value"].as_str())
+                {
+                    jar.cookies.insert(name.to_owned(), value.to_owned());
+                }
+            }
+            break;
+        }
+
+        if jar.has_login_session() {
+            jar.save_to_file(cookie_file)
+                .map_err(|e| websocket_error(format!("cannot save cookies: {e}")))?;
+            tracing::info!(
+                "Collected {} aliyun cookie(s) into {}",
+                jar.cookies.len(),
+                cookie_file.display()
+            );
+            let _ = child.kill();
+            return Ok(jar);
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    let _ = child.kill();
+    Err(websocket_error(format!(
+        "aliyun login did not complete within {wait_secs}s"
+    )))
 }
 
 /// A stream wrapper that prepends leftover bytes (read during HTTP upgrade)
@@ -389,10 +622,7 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for BufferedStream<
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
@@ -492,7 +722,9 @@ async fn manual_ws_upgrade<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unp
                     let mut parts = line.split(|&b| b == b' ');
                     parts.next(); // skip "HTTP/1.1"
                     parts.next().and_then(|code| {
-                        std::str::from_utf8(code).ok().and_then(|s| s.trim().parse::<u16>().ok())
+                        std::str::from_utf8(code)
+                            .ok()
+                            .and_then(|s| s.trim().parse::<u16>().ok())
                     })
                 })
                 .unwrap_or(0);
@@ -528,11 +760,9 @@ async fn manual_ws_upgrade<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unp
             )));
         }
 
-        if location.contains("account.aliyun.com") {
+        if is_aliyun_login_url(&location) {
             tracing::info!(
-                "WebSocket upgrade redirected to aliyun login: {}. \
-                 Recording {} cookie(s). Set EASYTIER_COOKIE_FILE to authenticate.",
-                location,
+                "WebSocket upgrade redirected to aliyun login ({status_code}): {location}, recording {} cookie(s)",
                 set_cookies.len()
             );
         } else {
@@ -546,6 +776,13 @@ async fn manual_ws_upgrade<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unp
     }
 
     if status_code != 101 {
+        if addr.host_str().is_some_and(|h| h.contains("login")) {
+            return Err(websocket_error(format!(
+                "server returned status {status_code} for login endpoint {addr}: \
+                 authentication required. Export the login cookies to a file and set \
+                 EASYTIER_COOKIE_FILE to it."
+            )));
+        }
         return Err(websocket_error(format!(
             "server did not switch protocols, status: {status_code}"
         )));
@@ -663,14 +900,22 @@ where
         ),
     };
 
-    let mut cookie_jar = if let Ok(path) = std::env::var("EASYTIER_COOKIE_FILE") {
-        match CookieJar::load_from_file(&path) {
+    let saved_cookie_file = cookie_file_path();
+    let mut cookie_jar = if saved_cookie_file.exists() {
+        match CookieJar::load_from_file(&saved_cookie_file.to_string_lossy()) {
             Ok(jar) => {
-                tracing::info!("Loaded {} cookie(s) from {path}", jar.cookies.len());
+                tracing::info!(
+                    "Loaded {} cookie(s) from {}",
+                    jar.cookies.len(),
+                    saved_cookie_file.display()
+                );
                 jar
             }
             Err(e) => {
-                tracing::warn!("Failed to load cookies from {path}: {e}");
+                tracing::warn!(
+                    "Failed to load cookies from {}: {e}",
+                    saved_cookie_file.display()
+                );
                 CookieJar::default()
             }
         }
@@ -693,6 +938,7 @@ where
         Either::Left(initial_stream);
 
     const MAX_REDIRECTS: usize = 10;
+    let mut login_attempted = false;
     for _ in 0..MAX_REDIRECTS {
         let builder =
             ClientBuilder::from_uri(http::Uri::try_from(current_url.to_string()).unwrap())
@@ -713,9 +959,49 @@ where
                 for cookie in &set_cookies {
                     cookie_jar.add_set_cookie(cookie);
                 }
+
+                // Not signed in yet: pop up a browser window and wait for the
+                // user to finish the login, then retry the original endpoint.
+                if is_aliyun_login_url(&location)
+                    && !cookie_jar.has_login_session()
+                    && !login_attempted
+                {
+                    login_attempted = true;
+                    let cookie_file = cookie_file_path();
+                    cookie_jar
+                        .cookies
+                        .extend(interactive_login(&location, &cookie_file).await?.cookies);
+                    current_url = remote_url.clone();
+                    let socket = if resolved_remote_addr.is_ipv4() {
+                        TcpSocket::new_v4()?
+                    } else {
+                        TcpSocket::new_v6()?
+                    };
+                    let tcp_stream = socket.connect(resolved_remote_addr).await?;
+                    let rt_socket = RuntimeTcpSocket::new(tcp_stream);
+                    stream = Either::Right(if initial_is_wss {
+                        let tls = tokio_rustls::TlsConnector::from(Arc::new(
+                            get_insecure_tls_client_config(),
+                        ));
+                        let sni = remote_url.domain().unwrap_or("localhost").to_owned();
+                        let server_name = rustls::pki_types::ServerName::try_from(sni)
+                            .map_err(|_| TunnelError::InvalidProtocol("Invalid SNI".to_owned()))?;
+                        MaybeTlsStream::Rustls(tls.connect(server_name, rt_socket).await?)
+                    } else {
+                        MaybeTlsStream::Plain(rt_socket)
+                    });
+                    continue;
+                }
+
                 current_url = resolve_redirect(&current_url, &location)?;
                 let new_is_wss = is_wss(&current_url)?;
-                let addr = SocketAddr::from_url(current_url.clone(), IpVersion::Both).await?;
+                // easytier's socket_addrs only accepts an explicit port or an easytier
+                // scheme; http/https have no easytier default port, so fill it in here.
+                let mut resolve_url = current_url.clone();
+                if resolve_url.port().is_none() {
+                    let _ = resolve_url.set_port(Some(if new_is_wss { 443 } else { 80 }));
+                }
+                let addr = SocketAddr::from_url(resolve_url, IpVersion::Both).await?;
                 let socket = if addr.is_ipv4() {
                     TcpSocket::new_v4()?
                 } else {
