@@ -16,6 +16,7 @@ use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
     pin::Pin,
+    sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, LazyLock},
     task::{Context, Poll},
     time::Duration,
@@ -44,6 +45,11 @@ static TRUSTED_PROXIES: LazyLock<Vec<IpCidr>> = LazyLock::new(|| {
     .map(|cidr| cidr.parse().unwrap())
     .collect()
 });
+
+/// Whether the browser-driven aliyun login is already running in the background.
+/// Stops the outer retry loop from spawning yet another browser window every time
+/// CONNECT_TIMEOUT fires.
+static LOGIN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 fn trusted_proxy_contains(ip: IpAddr) -> bool {
     TRUSTED_PROXIES.iter().any(|cidr| match (cidr, ip) {
@@ -368,11 +374,14 @@ impl CookieJar {
         std::fs::write(path, body)
     }
 
-    /// Whether the jar already carries an authenticated aliyun session.
+    /// Whether the jar already carries an authenticated aliyun DSW session.
+    /// We only trust cookies that were set on the gateway domain itself, which
+    /// means the full OAuth callback round-trip completed — cookies captured
+    /// on `account.aliyun.com` alone are useless.
     fn has_login_session(&self) -> bool {
         self.cookies.contains_key("login_aliyunid_ticket")
             || self.cookies.contains_key("login_aliyunid_pk")
-            || (self.cookies.contains_key("cookie2") && self.cookies.contains_key("unb"))
+            || self.cookies.contains_key("cookie2")
     }
 }
 
@@ -483,16 +492,42 @@ async fn http_get_local(port: u16, path: &str) -> Result<String, TunnelError> {
         .unwrap_or_default())
 }
 
-/// Pop up a browser window for the user to sign in, then harvest the aliyun
-/// cookies through the Chromium DevTools protocol and store them on disk.
+/// Pop up a browser window for the user to sign in, letting the browser follow
+/// the full OAuth 302 chain itself (so that the callback sets cookies on the
+/// gateway domain), then harvest those cookies through the Chromium DevTools
+/// protocol and store them on disk.
+///
+/// `entry_url` should be the original protected endpoint (e.g. the wss URL we
+/// failed to connect to), not the 302 redirect target — the latter only takes
+/// us to the login page, missing the OAuth callback that writes the real
+/// gateway session cookie.
 async fn interactive_login(
-    login_url: &str,
+    entry_url: &url::Url,
     cookie_file: &std::path::Path,
 ) -> Result<CookieJar, TunnelError> {
     use futures::{SinkExt, StreamExt};
 
+    // Open the HTTP(S) counterpart of the wss:// URL so that the browser
+    // follows the 302 chain all the way through the OAuth callback.
+    let browser_url = {
+        let mut u = entry_url.clone();
+        match u.scheme() {
+            "wss" => {
+                u.set_scheme("https").map_err(|_| {
+                    TunnelError::InvalidProtocol("cannot switch wss to https".into())
+                })?;
+            }
+            "ws" => {
+                u.set_scheme("http")
+                    .map_err(|_| TunnelError::InvalidProtocol("cannot switch ws to http".into()))?;
+            }
+            _ => {} // already http/https, use as-is
+        }
+        u.to_string()
+    };
+
     let port = free_local_port()?;
-    let mut child = launch_browser(login_url, port)?;
+    let mut child = launch_browser(&browser_url, port)?;
 
     // Wait for the devtools endpoint of the freshly started browser.
     let mut websocket_url = None;
@@ -554,7 +589,14 @@ async fn interactive_login(
             }
             for cookie in value["result"]["cookies"].as_array().into_iter().flatten() {
                 let domain = cookie["domain"].as_str().unwrap_or_default();
-                if !domain.contains("aliyun.com") {
+                // Only trust cookies that were set on the gateway's own domain
+                // — those can only appear after the OAuth callback redirect
+                // completes. Cookies on `account.aliyun.com` are intermediate
+                // and won't be honoured by the gateway anyway.
+                let is_gateway_cookie = domain.ends_with(".data.aliyun.com")
+                    || domain == "data.aliyun.com"
+                    || domain.contains(".dsw-gateway-");
+                if !is_gateway_cookie {
                     continue;
                 }
                 if let (Some(name), Some(value)) =
@@ -562,20 +604,20 @@ async fn interactive_login(
                 {
                     jar.cookies.insert(name.to_owned(), value.to_owned());
                 }
+                break;
             }
-            break;
-        }
 
-        if jar.has_login_session() {
-            jar.save_to_file(cookie_file)
-                .map_err(|e| websocket_error(format!("cannot save cookies: {e}")))?;
-            tracing::info!(
-                "Collected {} aliyun cookie(s) into {}",
-                jar.cookies.len(),
-                cookie_file.display()
-            );
-            let _ = child.kill();
-            return Ok(jar);
+            if jar.has_login_session() {
+                jar.save_to_file(cookie_file)
+                    .map_err(|e| websocket_error(format!("cannot save cookies: {e}")))?;
+                tracing::info!(
+                    "Collected {} aliyun cookie(s) into {}",
+                    jar.cookies.len(),
+                    cookie_file.display()
+                );
+                let _ = child.kill();
+                return Ok(jar);
+            }
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
@@ -715,19 +757,31 @@ async fn manual_ws_upgrade<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unp
             let header_block = &buf[..header_end];
             let mut lines = header_block.split(|&b| b == b'\n');
 
-            // Parse status line: HTTP/1.1 <code> <reason>
-            let status_code = lines
-                .next()
-                .and_then(|line| {
-                    let mut parts = line.split(|&b| b == b' ');
-                    parts.next(); // skip "HTTP/1.1"
-                    parts.next().and_then(|code| {
+            // Guard: the very first line MUST start with "HTTP/" or the server
+            // isn't speaking HTTP at all (e.g. a proxy injecting SOCKS5/STUN/llhttp).
+            let first_line = lines.next().unwrap_or_default();
+            if first_line.len() < 5 || &first_line[..5] != b"HTTP/" {
+                let dump = String::from_utf8_lossy(&buf[..total_read.min(256)])
+                    .replace('\r', "\\r")
+                    .replace('\n', "\\n");
+                return Err(websocket_error(format!(
+                    "server did not speak HTTP during WebSocket handshake: \
+                     expected 'HTTP/' status line, got first bytes: {dump}"
+                )));
+            }
+
+            let status_code = {
+                let mut parts = first_line.split(|&b| b == b' ');
+                parts.next(); // skip "HTTP/1.1"
+                parts
+                    .next()
+                    .and_then(|code| {
                         std::str::from_utf8(code)
                             .ok()
                             .and_then(|s| s.trim().parse::<u16>().ok())
                     })
-                })
-                .unwrap_or(0);
+                    .unwrap_or(0)
+            };
 
             let mut location = String::new();
             let mut set_cookies: Vec<String> = Vec::new();
@@ -960,37 +1014,50 @@ where
                     cookie_jar.add_set_cookie(cookie);
                 }
 
-                // Not signed in yet: pop up a browser window and wait for the
-                // user to finish the login, then retry the original endpoint.
+                // Not signed in yet: pop up a browser window in the background so
+                // that the outer CONNECT_TIMEOUT (typically 20s) does not cancel it,
+                // then bail out of this connect attempt immediately. The cookie file
+                // written by the background task will be picked up on the next retry.
                 if is_aliyun_login_url(&location)
                     && !cookie_jar.has_login_session()
                     && !login_attempted
                 {
                     login_attempted = true;
-                    let cookie_file = cookie_file_path();
-                    cookie_jar
-                        .cookies
-                        .extend(interactive_login(&location, &cookie_file).await?.cookies);
-                    current_url = remote_url.clone();
-                    let socket = if resolved_remote_addr.is_ipv4() {
-                        TcpSocket::new_v4()?
+
+                    if LOGIN_IN_PROGRESS
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        let cookie_file = cookie_file_path();
+                        tracing::warn!(
+                            "Opening a browser window for the aliyun login in the \
+                             background. The current connect attempt will time out, \
+                             but once you finish signing in the cookie file will be \
+                             saved to {} — restart easytier or wait for the next retry.",
+                            cookie_file.display()
+                        );
+
+                        tokio::spawn(async move {
+                            // Hand the *original* wss endpoint to interactive_login
+                            // and let it open the https:// counterpart — that way
+                            // the browser follows the full 302 chain through the
+                            // OAuth callback, which is where the gateway actually
+                            // writes its session cookie. Feeding it `location` (the
+                            // account.aliyun.com login URL) would skip that step.
+                            let _ = interactive_login(&remote_url, &cookie_file).await;
+                            LOGIN_IN_PROGRESS.store(false, Ordering::Relaxed);
+                        });
                     } else {
-                        TcpSocket::new_v6()?
-                    };
-                    let tcp_stream = socket.connect(resolved_remote_addr).await?;
-                    let rt_socket = RuntimeTcpSocket::new(tcp_stream);
-                    stream = Either::Right(if initial_is_wss {
-                        let tls = tokio_rustls::TlsConnector::from(Arc::new(
-                            get_insecure_tls_client_config(),
-                        ));
-                        let sni = remote_url.domain().unwrap_or("localhost").to_owned();
-                        let server_name = rustls::pki_types::ServerName::try_from(sni)
-                            .map_err(|_| TunnelError::InvalidProtocol("Invalid SNI".to_owned()))?;
-                        MaybeTlsStream::Rustls(tls.connect(server_name, rt_socket).await?)
-                    } else {
-                        MaybeTlsStream::Plain(rt_socket)
-                    });
-                    continue;
+                        tracing::debug!(
+                            "aliyun login is already in progress elsewhere; \
+                             skipping duplicate popup"
+                        );
+                    }
+
+                    return Err(websocket_error(format!(
+                        "redirected to aliyun login, browser popup scheduled for \
+                         {location} — re-run after signing in"
+                    )));
                 }
 
                 current_url = resolve_redirect(&current_url, &location)?;
