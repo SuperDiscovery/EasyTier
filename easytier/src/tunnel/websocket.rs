@@ -558,19 +558,66 @@ async fn interactive_login(
         .unwrap_or(300);
     tracing::info!("Waiting up to {wait_secs}s for the aliyun login to finish");
 
-    let mut method = "Storage.getCookies";
+    // Detect completion by watching the tab URLs: the OAuth flow goes
+    // gateway -> account.aliyun.com/login -> gateway (the oauth_callback).
+    // Returning to the gateway host means the callback already ran and the
+    // session cookie is set. Note the final page usually renders
+    // "upstream connect error ... protocol error": the /ide/proxy/<port>/ path
+    // only speaks WebSocket, so a plain browser GET always errors out upstream.
+    // That page is harmless — authentication has already succeeded by then.
+    let entry_host = entry_url.host_str().unwrap_or_default().to_owned();
+    let mut saw_login_page = false;
+    let mut logged_in = false;
     for _ in 0..wait_secs {
-        if ws
-            .send(Message::text(format!(
-                "{{\"id\":1,\"method\":\"{method}\"}}"
-            )))
-            .await
-            .is_err()
+        if let Ok(body) = http_get_local(port, "/json/list").await
+            && let Ok(targets) = serde_json::from_str::<serde_json::Value>(&body)
         {
+            for target in targets.as_array().into_iter().flatten() {
+                if target["type"].as_str() != Some("page") {
+                    continue;
+                }
+                let page_url = target["url"].as_str().unwrap_or_default();
+                if page_url.is_empty() || page_url.starts_with("chrome-error://") {
+                    continue;
+                }
+                if page_url.contains(&entry_host) {
+                    if saw_login_page {
+                        logged_in = true;
+                        break;
+                    }
+                } else {
+                    saw_login_page = true;
+                }
+            }
+        }
+        if logged_in {
+            tracing::info!("aliyun login finished, harvesting cookies");
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    if !logged_in {
+        let _ = child.kill();
+        return Err(websocket_error(format!(
+            "aliyun login did not complete within {wait_secs}s"
+        )));
+    }
+
+    // Let the callback response settle before reading the cookie store.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Harvest every aliyun cookie. The gateway validates the ticket server-side,
+    // so the parent-domain `.aliyun.com` cookies are exactly what it expects.
+    let mut jar = CookieJar::default();
+    let mut method = "Storage.getCookies";
+    for _ in 0..3 {
+        let payload = format!("{{\"id\":1,\"method\":\"{method}\"}}");
+        if ws.send(Message::text(payload)).await.is_err() {
             break;
         }
 
-        let mut jar = CookieJar::default();
+        let mut switch_method = false;
         while let Ok(Some(Ok(message))) =
             tokio::time::timeout(Duration::from_secs(5), ws.next()).await
         {
@@ -584,19 +631,14 @@ async fn interactive_login(
                 continue;
             }
             if value.get("error").is_some() {
+                // Storage.getCookies is not available on very old builds.
                 method = "Network.getAllCookies";
+                switch_method = true;
                 break;
             }
             for cookie in value["result"]["cookies"].as_array().into_iter().flatten() {
                 let domain = cookie["domain"].as_str().unwrap_or_default();
-                // Only trust cookies that were set on the gateway's own domain
-                // — those can only appear after the OAuth callback redirect
-                // completes. Cookies on `account.aliyun.com` are intermediate
-                // and won't be honoured by the gateway anyway.
-                let is_gateway_cookie = domain.ends_with(".data.aliyun.com")
-                    || domain == "data.aliyun.com"
-                    || domain.contains(".dsw-gateway-");
-                if !is_gateway_cookie {
+                if !domain.contains("aliyun.com") {
                     continue;
                 }
                 if let (Some(name), Some(value)) =
@@ -604,28 +646,34 @@ async fn interactive_login(
                 {
                     jar.cookies.insert(name.to_owned(), value.to_owned());
                 }
-                break;
             }
-
-            if jar.has_login_session() {
-                jar.save_to_file(cookie_file)
-                    .map_err(|e| websocket_error(format!("cannot save cookies: {e}")))?;
-                tracing::info!(
-                    "Collected {} aliyun cookie(s) into {}",
-                    jar.cookies.len(),
-                    cookie_file.display()
-                );
-                let _ = child.kill();
-                return Ok(jar);
-            }
+            break;
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        if switch_method {
+            continue;
+        }
+        if !jar.cookies.is_empty() {
+            break;
+        }
     }
 
     let _ = child.kill();
-    Err(websocket_error(format!(
-        "aliyun login did not complete within {wait_secs}s"
-    )))
+
+    if jar.cookies.is_empty() {
+        return Err(websocket_error(
+            "login completed but no aliyun cookie could be read from the browser".to_owned(),
+        ));
+    }
+
+    jar.save_to_file(cookie_file)
+        .map_err(|e| websocket_error(format!("cannot save cookies: {e}")))?;
+    tracing::info!(
+        "Collected {} aliyun cookie(s) into {}",
+        jar.cookies.len(),
+        cookie_file.display()
+    );
+    Ok(jar)
 }
 
 /// A stream wrapper that prepends leftover bytes (read during HTTP upgrade)
