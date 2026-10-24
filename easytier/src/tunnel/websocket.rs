@@ -51,6 +51,15 @@ static TRUSTED_PROXIES: LazyLock<Vec<IpCidr>> = LazyLock::new(|| {
 /// CONNECT_TIMEOUT fires.
 static LOGIN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
+/// Clears `LOGIN_IN_PROGRESS` even when the login task panics or is cancelled.
+struct LoginInProgressGuard;
+
+impl Drop for LoginInProgressGuard {
+    fn drop(&mut self) {
+        LOGIN_IN_PROGRESS.store(false, Ordering::Relaxed);
+    }
+}
+
 fn trusted_proxy_contains(ip: IpAddr) -> bool {
     TRUSTED_PROXIES.iter().any(|cidr| match (cidr, ip) {
         (IpCidr::V4(cidr), IpAddr::V4(ip)) => cidr.contains(&ip),
@@ -396,6 +405,35 @@ fn is_aliyun_login_url(url: &str) -> bool {
     url.contains("account.aliyun.com")
 }
 
+/// A browser login is launched at most once per this window, tracked on disk so
+/// that a failed or abandoned login does not reopen a window on every reconnect
+/// retry (the connector retries every second) nor after a process restart.
+const LOGIN_RETRY_COOLDOWN: Duration = Duration::from_secs(600);
+
+fn login_marker_path(cookie_file: &std::path::Path) -> std::path::PathBuf {
+    let mut name = cookie_file.as_os_str().to_owned();
+    name.push(".attempted");
+    std::path::PathBuf::from(name)
+}
+
+fn login_recently_attempted(cookie_file: &std::path::Path) -> bool {
+    std::fs::metadata(login_marker_path(cookie_file))
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|mtime| mtime.elapsed().ok())
+        .is_some_and(|age| age < LOGIN_RETRY_COOLDOWN)
+}
+
+fn mark_login_attempted(cookie_file: &std::path::Path) {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    if let Err(e) = std::fs::write(login_marker_path(cookie_file), seconds.to_string()) {
+        tracing::debug!("cannot write the aliyun login marker: {e}");
+    }
+}
+
 fn free_local_port() -> Result<u16, TunnelError> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")
         .map_err(|e| websocket_error(format!("cannot reserve a local port: {e}")))?;
@@ -674,6 +712,59 @@ async fn interactive_login(
         cookie_file.display()
     );
     Ok(jar)
+}
+
+/// Confirm that the gateway accepts the harvested session by doing a throw-away
+/// WebSocket handshake with the cookies attached. Success means the next
+/// reconnect attempt will complete; a redirect back to the login page means the
+/// cookies were rejected and the user has to supply them manually.
+async fn verify_harvested_cookies(entry_url: &url::Url, jar: &CookieJar) {
+    let result = async {
+        let mut connect_url = entry_url.clone();
+        // socket_addrs has no known default port for wss, fill it in explicitly.
+        if connect_url.port().is_none() {
+            let port = if is_wss(entry_url)? { 443 } else { 80 };
+            let _ = connect_url.set_port(Some(port));
+        }
+        let addr = SocketAddr::from_url(connect_url, IpVersion::Both).await?;
+        let socket = if addr.is_ipv4() {
+            TcpSocket::new_v4()?
+        } else {
+            TcpSocket::new_v6()?
+        };
+        let tcp_stream = socket.connect(addr).await?;
+        let rt_socket = RuntimeTcpSocket::new(tcp_stream);
+
+        let stream: MaybeTlsStream<RuntimeTcpSocket> = if is_wss(entry_url)? {
+            let tls = tokio_rustls::TlsConnector::from(Arc::new(get_insecure_tls_client_config()));
+            let sni = entry_url.domain().unwrap_or("localhost").to_owned();
+            let server_name = rustls::pki_types::ServerName::try_from(sni)
+                .map_err(|_| TunnelError::InvalidProtocol("Invalid SNI".to_owned()))?;
+            MaybeTlsStream::Rustls(tls.connect(server_name, rt_socket).await?)
+        } else {
+            MaybeTlsStream::Plain(rt_socket)
+        };
+
+        let builder = ClientBuilder::from_uri(http::Uri::try_from(entry_url.to_string()).unwrap())
+            .max_headers(128);
+        match manual_ws_upgrade(&builder, stream, entry_url, jar).await? {
+            UpgradeOutcome::Success(_) => Ok::<(), TunnelError>(()),
+            UpgradeOutcome::Redirect { location, .. } => Err(websocket_error(format!(
+                "gateway still redirects to {location}"
+            ))),
+        }
+    }
+    .await;
+
+    match result {
+        Ok(()) => tracing::info!(
+            "aliyun cookies accepted by the gateway; the next reconnect attempt will connect"
+        ),
+        Err(e) => tracing::warn!(
+            "aliyun cookies were harvested but the gateway did not accept them ({e}); \
+             export the browser cookies manually and point EASYTIER_COOKIE_FILE at them"
+        ),
+    }
 }
 
 /// A stream wrapper that prepends leftover bytes (read during HTTP upgrade)
@@ -1062,49 +1153,70 @@ where
                     cookie_jar.add_set_cookie(cookie);
                 }
 
-                // Not signed in yet: pop up a browser window in the background so
-                // that the outer CONNECT_TIMEOUT (typically 20s) does not cancel it,
-                // then bail out of this connect attempt immediately. The cookie file
-                // written by the background task will be picked up on the next retry.
+                // Not signed in yet: pop up a browser window once per process and
+                // let it run in the background, so the outer reconnect timeout
+                // cannot cancel the login. The manual connector retries every
+                // second, so as soon as the cookie file appears the next attempt
+                // picks it up and connects.
                 if is_aliyun_login_url(&location)
                     && !cookie_jar.has_login_session()
                     && !login_attempted
                 {
                     login_attempted = true;
+                    let cookie_file = cookie_file_path();
 
-                    if LOGIN_IN_PROGRESS
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-                        .is_ok()
-                    {
-                        let cookie_file = cookie_file_path();
-                        tracing::warn!(
-                            "Opening a browser window for the aliyun login in the \
-                             background. The current connect attempt will time out, \
-                             but once you finish signing in the cookie file will be \
-                             saved to {} — restart easytier or wait for the next retry.",
-                            cookie_file.display()
-                        );
-
-                        tokio::spawn(async move {
-                            // Hand the *original* wss endpoint to interactive_login
-                            // and let it open the https:// counterpart — that way
-                            // the browser follows the full 302 chain through the
-                            // OAuth callback, which is where the gateway actually
-                            // writes its session cookie. Feeding it `location` (the
-                            // account.aliyun.com login URL) would skip that step.
-                            let _ = interactive_login(&remote_url, &cookie_file).await;
-                            LOGIN_IN_PROGRESS.store(false, Ordering::Relaxed);
-                        });
-                    } else {
+                    if LOGIN_IN_PROGRESS.load(Ordering::Relaxed) {
                         tracing::debug!(
-                            "aliyun login is already in progress elsewhere; \
-                             skipping duplicate popup"
+                            "aliyun login is already running in the background; \
+                             waiting for it to finish"
                         );
+                        return Err(websocket_error(
+                            "aliyun login is running in the browser, waiting for it to finish"
+                                .to_owned(),
+                        ));
                     }
+
+                    if login_recently_attempted(&cookie_file) {
+                        tracing::debug!(
+                            "aliyun login was attempted within the last {}s; \
+                             not opening another browser window",
+                            LOGIN_RETRY_COOLDOWN.as_secs()
+                        );
+                        return Err(websocket_error(format!(
+                            "redirected to aliyun login at {location}, but a browser \
+                             login already ran recently and did not produce a working \
+                             session — export the cookies manually and point \
+                             EASYTIER_COOKIE_FILE at them, or remove {} to retry",
+                            login_marker_path(&cookie_file).display()
+                        )));
+                    }
+
+                    LOGIN_IN_PROGRESS.store(true, Ordering::Relaxed);
+                    mark_login_attempted(&cookie_file);
+                    tracing::warn!(
+                        "Opening a browser window for the aliyun login in the \
+                         background; the cookie file will be written to {} once \
+                         you finish signing in. Further reconnect attempts keep \
+                         running, so the tunnel comes up right after the login.",
+                        cookie_file.display()
+                    );
+
+                    tokio::spawn(async move {
+                        let _guard = LoginInProgressGuard;
+                        // Hand the *original* wss endpoint to interactive_login
+                        // and let it open the https:// counterpart — that way
+                        // the browser follows the full 302 chain through the
+                        // OAuth callback, which is where the gateway actually
+                        // writes its session cookie.
+                        match interactive_login(&remote_url, &cookie_file).await {
+                            Ok(jar) => verify_harvested_cookies(&remote_url, &jar).await,
+                            Err(e) => tracing::warn!("aliyun browser login failed: {e}"),
+                        }
+                    });
 
                     return Err(websocket_error(format!(
                         "redirected to aliyun login, browser popup scheduled for \
-                         {location} — re-run after signing in"
+                         {location} — the tunnel will connect as soon as you sign in"
                     )));
                 }
 
